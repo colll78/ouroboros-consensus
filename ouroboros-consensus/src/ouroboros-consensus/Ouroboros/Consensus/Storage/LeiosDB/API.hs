@@ -21,6 +21,7 @@ module Ouroboros.Consensus.Storage.LeiosDB.API
   , withWriter
   , allocateWriter
   , CompletedEbs
+  , TxOffset
   ) where
 
 import Cardano.Slotting.Slot (SlotNo)
@@ -36,6 +37,7 @@ import Ouroboros.Consensus.Leios.Types
   , LeiosEb
   , LeiosPoint
   , TxHash
+  , TxOffset
   )
 import Ouroboros.Consensus.Storage.LeiosDB.Trace (LeiosDbStats (..))
 import Ouroboros.Consensus.Util.IOLike (IOLike, MonadThrow, NoThunks (..), bracket)
@@ -113,8 +115,16 @@ data LeiosDbWriter m = LeiosDbWriter
   -- be this same EB which got completed.
   , writeTxs ::
       HasCallStack =>
-      [(TxHash, ByteString)] -> m (Promise m CompletedEbs)
-  -- ^ Persist tx bodies. Returns the EBs whose closure this completed.
+      LeiosPoint -> [(TxOffset, ByteString)] -> m (Promise m CompletedEbs)
+  -- ^ Persist tx bodies for one EB, keyed by their offset into its body.
+  --
+  -- Bytes are owned by the referencing EB (stored per @(ebHash, txOffset)@,
+  -- duplicated when EBs share a tx), so writes are sequential within the EB
+  -- rather than scattered by hash, and eviction is a range delete. A tx is
+  -- only stored if the EB's body is already written, the offset is in it, it
+  -- is not yet stored, and its size is the declared one; anything else is
+  -- dropped. Returns the points this completed: the given EB's, plus any other
+  -- point announcing the same content hash, merely at a different slot.
   }
   deriving NoThunks via OnlyCheckWhnfNamed "LeiosDbWriter" (LeiosDbWriter m)
 
