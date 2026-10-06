@@ -67,14 +67,14 @@ where
 
 import Cardano.Binary
 import qualified Codec.CBOR.Read as CBOR
-import Control.Monad (filterM, forM, forM_, unless, void)
+import Control.Monad (filterM, forM_, unless, void)
 import Control.Monad.State.Strict (StateT, get, lift, put)
 import Control.ResourceRegistry (WithTempRegistry, allocateTemp, modifyWithTempRegistry)
 import Control.Tracer (Tracer, nullTracer, traceWith)
 import Data.Bifunctor (first)
 import qualified Data.ByteString.Lazy as BSL
 import Data.List (isSuffixOf, stripPrefix)
-import Data.Maybe (catMaybes, mapMaybe)
+import Data.Maybe (mapMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (pack)
@@ -132,6 +132,9 @@ data CertFileError
   | -- | The payload's CRC does not match the one stored in the file,
     -- i.e. the file is corrupt (bit rot, a partial write, etc).
     CertFileChecksumMismatch
+  | -- | The round encoded in the payload disagrees with the round encoded in
+    -- the file name used to index it.
+    CertFileRoundMismatch PerasRoundNo PerasRoundNo
   deriving stock Show
 
 -- | A short human-readable description of a 'CertFileError', for tracing.
@@ -140,6 +143,11 @@ displayCertFileError = \case
   CertFileReadError err -> "Read error: " <> show err
   CertFileMalformed err -> "Malformed: " <> show err
   CertFileChecksumMismatch -> "CRC mismatch"
+  CertFileRoundMismatch fileRound payloadRound ->
+    "Round mismatch: filename says "
+      <> show fileRound
+      <> ", payload says "
+      <> show payloadRound
 
 {-------------------------------------------------------------------------------
   Trace types
@@ -287,6 +295,7 @@ implGetCertsAfter ::
   forall m blk.
   ( IOLike m
   , DecodeDisk blk (PerasCert blk)
+  , IsPerasCert (PerasCert blk) blk
   ) =>
   PerasImmutableCertDbEnv m blk ->
   PerasRoundNo ->
@@ -297,21 +306,19 @@ implGetCertsAfter env roundNo maxCerts = do
   -- or may not show up in this snapshot.
   rounds <- atomically $ readSVarSTM (picdbKnownRounds env)
   let roundsAfter = snd $ Set.split roundNo rounds
-      -- 'take' uses an 'Int', while the public API uses 'Word64'. Saturate
-      -- instead of allowing a large limit (notably 'maxBound') to wrap to a
-      -- negative 'Int' and produce an empty result.
-      maxCertsAsInt =
-        fromIntegral $
-          min maxCerts (fromIntegral (maxBound :: Int))
-      candidates = take maxCertsAsInt (Set.toAscList roundsAfter)
-  -- Read each certificate on demand. A certificate whose file is unreadable or
-  -- corrupt is quarantined (traced and dropped from the index) rather than
-  -- failing the whole request, so that the remaining certificates stay
-  -- available to syncing nodes.
-  fmap catMaybes $ forM candidates $ \r ->
+  collect [] maxCerts (Set.toAscList roundsAfter)
+ where
+  -- The limit counts certificates returned, not indexed file names inspected.
+  -- In particular, an unreadable candidate must not truncate the page before
+  -- later intact certificates are considered.
+  collect acc 0 _ = pure (reverse acc)
+  collect acc _ [] = pure (reverse acc)
+  collect acc remaining (r : rs) =
     readCertFile env r >>= \case
-      Right cert -> pure (Just cert)
-      Left err -> Nothing <$ quarantineCert env r err
+      Right cert -> collect (cert : acc) (remaining - 1) rs
+      Left err -> do
+        quarantineCert env r err
+        collect acc remaining rs
 
 -- | Drop a certificate's round from the in-memory index and trace why. Used
 -- when a certificate file turns out to be unreadable or corrupt; see
@@ -337,8 +344,9 @@ certFileExtension = ".cert"
 
 -- | The name of the file storing the certificate of the given round number.
 --
--- The round number is encoded in the file name (and nowhere else), so that it
--- can be recovered without reading the file, see 'certRoundFromFileName'.
+-- The file name duplicates the round encoded in the certificate payload so the
+-- index can be rebuilt without reading every file. The two copies are checked
+-- for agreement whenever the file is validated.
 certFileName :: PerasRoundNo -> String
 certFileName roundNo = show (unPerasRoundNo roundNo) <> certFileExtension
 
@@ -484,28 +492,41 @@ readCertFile ::
   forall m blk.
   ( IOLike m
   , DecodeDisk blk (PerasCert blk)
+  , IsPerasCert (PerasCert blk) blk
   ) =>
   PerasImmutableCertDbEnv m blk ->
   PerasRoundNo ->
   m (Either CertFileError (ValidatedPerasCert blk))
 readCertFile env roundNo =
   case picdbHasFS env of
-    SomeHasFS hasFS -> readCertFileAt (picdbCodecConfig env) hasFS (fsPathCertFile roundNo)
+    SomeHasFS hasFS ->
+      readCertFileAt
+        (picdbCodecConfig env)
+        hasFS
+        roundNo
+        (fsPathCertFile roundNo)
 
 readCertFileAt ::
   forall m h blk.
   ( IOLike m
   , DecodeDisk blk (PerasCert blk)
+  , IsPerasCert (PerasCert blk) blk
   ) =>
   CodecConfig blk ->
   HasFS m h ->
+  PerasRoundNo ->
   FsPath ->
   m (Either CertFileError (ValidatedPerasCert blk))
-readCertFileAt ccfg hasFS path = do
+readCertFileAt ccfg hasFS fileRound path = do
   readResult <- try $ withFile hasFS path ReadMode (hGetAll hasFS)
   pure $ case readResult of
     Left (err :: FsError) -> Left (CertFileReadError err)
-    Right bytes -> decodeCertFile ccfg bytes
+    Right bytes -> do
+      cert <- decodeCertFile ccfg bytes
+      let payloadRound = getPerasCertRound cert
+      if payloadRound == fileRound
+        then Right cert
+        else Left (CertFileRoundMismatch fileRound payloadRound)
 
 -- | Index the round numbers of all certificate files in the database
 -- directory.
@@ -540,6 +561,7 @@ sweepTempCertFiles hasFS = do
 validateAllCertsOnOpen ::
   ( IOLike m
   , DecodeDisk blk (PerasCert blk)
+  , IsPerasCert (PerasCert blk) blk
   ) =>
   Tracer m (TraceEvent blk) ->
   CodecConfig blk ->
@@ -550,7 +572,7 @@ validateAllCertsOnOpen tracer ccfg hasFS rounds =
   fmap Set.fromList $ filterM isIntact $ Set.toList rounds
  where
   isIntact roundNo =
-    readCertFileAt ccfg hasFS (fsPathCertFile roundNo) >>= \case
+    readCertFileAt ccfg hasFS roundNo (fsPathCertFile roundNo) >>= \case
       Right _ -> pure True
       Left err -> do
         traceWith tracer (QuarantinedCert roundNo (displayCertFileError err))

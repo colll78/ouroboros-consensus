@@ -3,6 +3,8 @@
 
 module Test.Ouroboros.Storage.PerasImmutableCertDB (tests) where
 
+import Cardano.Binary (Decoder, fromCBOR, serialize, toCBOR)
+import qualified Codec.CBOR.Read as CBOR
 import Control.Concurrent
   ( forkIO
   , newEmptyMVar
@@ -23,7 +25,7 @@ import Data.List.NonEmpty (NonEmpty ((:|)))
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.Set.NonEmpty as NESet
-import Data.Word (Word16, Word8, Word64)
+import Data.Word (Word16, Word32, Word8, Word64)
 import Ouroboros.Consensus.Block
 import Ouroboros.Consensus.Peras.Cert.Mock (MockPerasCert (..))
 import qualified Ouroboros.Consensus.Storage.PerasImmutableCertDB as DB
@@ -39,6 +41,7 @@ import System.FS.Sim.Error
 import qualified System.FS.Sim.MockFS as MockFS
 import qualified System.FS.Sim.Stream as Stream
 import System.FS.Sim.STM (simHasFS)
+import System.FS.CRC (CRC (..), computeCRC)
 import Test.Ouroboros.Storage.TestBlock
   ( CodecConfig (TestBlockCodecConfig)
   , TestBlock
@@ -72,6 +75,22 @@ tests =
     , testCase "non-certificate directory entries are not served" testForeignFilesIgnored
     , testCase "a missing file is quarantined on read" testMissingFileQuarantined
     , testCase "a corrupt file is quarantined on read" testCorruptFileQuarantined
+    , testCase "corruption does not shorten a page" testCorruptFileDoesNotShortenPage
+    , testCase "filename round must match encoded certificate round" testFileNameRoundMismatch
+    , testGroup
+        "hostile certificate file contents"
+        [ testCase (show policy <> "/" <> show hostile) $
+            testHostileCertificateFile policy hostile
+        | policy <- [DB.ValidateOnRead, DB.ValidateAllOnOpen]
+        , hostile <- [minBound .. maxBound]
+        ]
+    , testGroup
+        "quarantined rounds can be repaired"
+        [ testCase (show policy <> "/" <> show damage) $
+            testQuarantinedRoundCanBeRepaired policy damage
+        | policy <- [DB.ValidateOnRead, DB.ValidateAllOnOpen]
+        , damage <- [minBound .. maxBound]
+        ]
     , testCase "eager validation quarantines corruption on open" testEagerValidation
     , testCase "lazy validation traces quarantine exactly once" testLazyQuarantineTrace
     , testCase "eager validation traces quarantine during open" testEagerQuarantineTrace
@@ -190,6 +209,148 @@ testCorruptFileQuarantined =
       >>= (@?= [PerasRoundNo 2])
     roundsOf <$> DB.getCertsAfter db (PerasRoundNo 0) 10
       >>= (@?= [PerasRoundNo 2])
+
+testCorruptFileDoesNotShortenPage :: IO ()
+testCorruptFileDoesNotShortenPage =
+  withFreshDBFS $ \fs _args db -> do
+    addRounds db [1, 2, 3]
+    replaceRawFile fs (certPath 1) (BSL.pack [0xde, 0xad, 0xbe, 0xef])
+
+    roundsOf <$> DB.getCertsAfter db (PerasRoundNo 0) 2
+      >>= (@?= [PerasRoundNo 2, PerasRoundNo 3])
+
+testFileNameRoundMismatch :: IO ()
+testFileNameRoundMismatch =
+  withFreshDBFS $ \fs args db -> do
+    addRounds db [1]
+    renameFile (simHasFS fs) (certPath 1) (certPath 2)
+
+    reopened <- DB.createDB args
+    roundsOf <$> DB.getCertsAfter reopened (PerasRoundNo 0) 10
+      >>= (@?= [])
+    roundsOf <$> DB.getCertsAfter reopened (PerasRoundNo 0) 10
+      >>= (@?= [])
+
+data HostileCertFile
+  = TruncatedCRC
+  | ValidCRCMalformedCBOR
+  | ValidCertificateWithTrailingBytes
+  | LargeMalformedPayload
+  deriving (Bounded, Enum, Show)
+
+-- | Exercise each framing layer independently: the leading CRC, a payload
+-- whose CRC is valid but whose CBOR is not, a valid certificate with trailing
+-- bytes, and a large malformed payload. In every case the bad round is
+-- quarantined without hiding the following intact certificate.
+testHostileCertificateFile ::
+  DB.PerasImmutableCertDbValidationPolicy ->
+  HostileCertFile ->
+  IO ()
+testHostileCertificateFile policy hostile =
+  withFreshDBFS $ \fs args db -> do
+    addRounds db [1, 2]
+    bytes <- hostileCertFileBytes fs hostile
+    replaceRawFile fs (certPath 1) bytes
+
+    reopened <-
+      DB.createDB
+        args
+          { DB.picdbaValidationPolicy = policy
+          }
+    roundsOf <$> DB.getCertsAfter reopened (PerasRoundNo 0) 10
+      >>= (@?= [PerasRoundNo 2])
+    roundsOf <$> DB.getCertsAfter reopened (PerasRoundNo 0) 10
+      >>= (@?= [PerasRoundNo 2])
+
+hostileCertFileBytes ::
+  StrictTMVar IO MockFS.MockFS ->
+  HostileCertFile ->
+  IO BSL.ByteString
+hostileCertFileBytes fs = \case
+  TruncatedCRC ->
+    pure $ BSL.pack [0x1a, 0x00]
+  ValidCRCMalformedCBOR ->
+    pure $ frameCertPayload (BSL.pack [0xff])
+  ValidCertificateWithTrailingBytes -> do
+    validFile <- readRawFile fs (certPath 1)
+    payload <- case CBOR.deserialiseFromBytes decodeCRC validFile of
+      Left err -> do
+        assertFailure $ "could not decode test certificate CRC: " <> show err
+        pure BSL.empty
+      Right (payload, _crc) -> pure payload
+    pure $ frameCertPayload (payload <> BSL.singleton 0)
+  LargeMalformedPayload ->
+    pure $ frameCertPayload (BSL.replicate (1024 * 1024) 0xff)
+ where
+  decodeCRC :: Decoder s Word32
+  decodeCRC = fromCBOR
+
+frameCertPayload :: BSL.ByteString -> BSL.ByteString
+frameCertPayload payload =
+  serialize (toCBOR (getCRC $ computeCRC payload)) <> payload
+
+data CertFileDamage
+  = MissingCertFile
+  | CorruptCertFile
+  deriving (Bounded, Enum, Show)
+
+-- | Once a bad file has been quarantined, adding a valid certificate for the
+-- same round repairs the database and remains valid after another reopen.
+testQuarantinedRoundCanBeRepaired ::
+  DB.PerasImmutableCertDbValidationPolicy ->
+  CertFileDamage ->
+  IO ()
+testQuarantinedRoundCanBeRepaired policy damage =
+  withFreshDBFS $ \fs args db -> do
+    let cert = mkCertWithBoost 7 3
+        argsWithPolicy =
+          args
+            { DB.picdbaValidationPolicy = policy
+            }
+
+    DB.addCert db cert
+      >>= (@?= DB.AddedCertToImmutableDB)
+
+    quarantinedDb <- case (policy, damage) of
+      -- Eager validation can discover corruption during open.
+      (DB.ValidateAllOnOpen, CorruptCertFile) -> do
+        damageCertFile fs damage 7
+        DB.createDB argsWithPolicy
+      -- A missing file can only be quarantined after it has been indexed.
+      -- Lazy validation likewise discovers either kind of damage on query.
+      _ -> do
+        opened <- DB.createDB argsWithPolicy
+        damageCertFile fs damage 7
+        DB.getCertsAfter opened (PerasRoundNo 0) 10
+          >>= (@?= [])
+        pure opened
+
+    DB.getCertsAfter quarantinedDb (PerasRoundNo 0) 10
+      >>= (@?= [])
+
+    DB.addCert quarantinedDb cert
+      >>= (@?= DB.AddedCertToImmutableDB)
+    DB.getCertsAfter quarantinedDb (PerasRoundNo 0) 10
+      >>= (@?= [cert])
+
+    reopened <- DB.createDB argsWithPolicy
+    DB.getCertsAfter reopened (PerasRoundNo 0) 10
+      >>= (@?= [cert])
+
+damageCertFile ::
+  StrictTMVar IO MockFS.MockFS ->
+  CertFileDamage ->
+  Word64 ->
+  IO ()
+damageCertFile fs damage roundNo =
+  case damage of
+    MissingCertFile ->
+      removeFile (simHasFS fs) (certPath roundNo)
+    CorruptCertFile ->
+      replaceRawFile
+        fs
+        (certPath roundNo)
+        (BSL.pack [0xde, 0xad, 0xbe, 0xef])
 
 testEagerValidation :: IO ()
 testEagerValidation =
@@ -716,6 +877,15 @@ writeRawFile fs path bytes = do
   createDirectoryIfMissing hasFS True (mkFsPath [])
   withFile hasFS path (WriteMode MustBeNew) $ \h ->
     void $ hPutAll hasFS h bytes
+
+readRawFile ::
+  StrictTMVar IO MockFS.MockFS ->
+  FsPath ->
+  IO BSL.ByteString
+readRawFile fs path = do
+  let hasFS = simHasFS fs
+  withFile hasFS path ReadMode $ \h ->
+    hGetAll hasFS h
 
 replaceRawFile ::
   StrictTMVar IO MockFS.MockFS ->
