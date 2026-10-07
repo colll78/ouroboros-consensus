@@ -35,6 +35,7 @@ import Cardano.Ledger.Api.Scripts
   , pattern AnyEraGuardingPurpose
   , pattern AnyEraMintingPurpose
   , pattern AnyEraProposingPurpose
+  , pattern AnyEraReceivingPurpose
   , pattern AnyEraSpendingPurpose
   , pattern AnyEraVotingPurpose
   , pattern AnyEraWithdrawingPurpose
@@ -56,9 +57,9 @@ import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Key as Aeson
 import qualified Data.ByteString.Base16 as B16
 import Data.List.NonEmpty (NonEmpty)
-import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map.NonEmpty (NonEmptyMap)
 import qualified Data.Map.NonEmpty as NonEmptyMap
+import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text.Encoding
@@ -114,8 +115,8 @@ renderTxIn (TxIn (TxId h) (TxIx ix)) =
 -- per-era @renderAlonzoPlutusPurpose@/@renderConwayPlutusPurpose@.
 --
 -- The projections are pattern synonyms, but @cardano-ledger-api@ ships a
--- @COMPLETE@ pragma covering all seven of them, so GHC does check exhaustiveness
--- here. Matching all seven rather than falling through to a catch-all means the
+-- @COMPLETE@ pragma covering all eight of them, so GHC does check exhaustiveness
+-- here. Matching all eight rather than falling through to a catch-all means the
 -- next ledger era shows up as a warning at compile time instead of as an
 -- unrenderable purpose in an operator's logs.
 renderScriptPurpose ::
@@ -126,12 +127,12 @@ renderScriptPurpose ::
   PlutusPurpose AsItem era ->
   Value
 -- Note the asymmetry in whether the 'AsItem' wrapper is unwrapped: spending,
--- rewarding and guarding render their item directly, the other four go through
+-- rewarding, guarding and receiving render their item directly; the other four use
 -- @ToJSON (AsItem ix it)@ and so come out wrapped in an @{"item": ...}@ object.
 -- That is what @cardano-api@'s renderer did for the six purposes it knew about,
 -- so it is what consumers parse; changing it is a deliberate format change, not
--- a cleanup to make here. Guarding is new in Dijkstra and has no @cardano-api@
--- rendering to preserve, so it renders directly, like the other two purposes
+-- a cleanup to make here. Guarding and receiving are new in Dijkstra and have no
+-- @cardano-api@ rendering to preserve, so they render directly, like the purposes
 -- for which we have a dedicated renderer.
 renderScriptPurpose = \case
   AnyEraSpendingPurpose (AsItem txin) ->
@@ -148,6 +149,8 @@ renderScriptPurpose = \case
     Aeson.object ["proposing" .= toJSON proposal]
   AnyEraGuardingPurpose (AsItem sHash) ->
     Aeson.object ["guarding" .= Aeson.String (renderScriptHash sHash)]
+  AnyEraReceivingPurpose (AsItem outputIndex) ->
+    Aeson.object ["receiving" .= toJSON outputIndex]
 
 -- | Render a plutus script purpose given by its index (redeemer pointer),
 -- era-generically.
@@ -156,9 +159,9 @@ renderScriptPurpose = \case
 -- @ToJSON ScriptWitnessIndex@ emitted: a @kind@ naming the witness index
 -- constructor and the index itself under @value@. The constructor names are
 -- @cardano-api@'s and do not all match the purpose names used by
--- 'renderScriptPurpose' above. @ScriptWitnessIndexGuarding@ is the exception:
--- @cardano-api@ has no constructor for the Dijkstra-era guarding purpose, so
--- that name is ours, following the same scheme.
+-- 'renderScriptPurpose' above. @ScriptWitnessIndexGuarding@ and
+-- @ScriptWitnessIndexReceiving@ follow the same scheme for the new Dijkstra-era
+-- purposes.
 renderScriptIndex :: AnyEraScript era => PlutusPurpose AsIx era -> Value
 renderScriptIndex = \case
   AnyEraSpendingPurpose (AsIx ix) -> witnessIndex "ScriptWitnessIndexTxIn" ix
@@ -168,6 +171,7 @@ renderScriptIndex = \case
   AnyEraVotingPurpose (AsIx ix) -> witnessIndex "ScriptWitnessIndexVoting" ix
   AnyEraProposingPurpose (AsIx ix) -> witnessIndex "ScriptWitnessIndexProposing" ix
   AnyEraGuardingPurpose (AsIx ix) -> witnessIndex "ScriptWitnessIndexGuarding" ix
+  AnyEraReceivingPurpose (AsIx ix) -> witnessIndex "ScriptWitnessIndexReceiving" ix
  where
   witnessIndex :: Text -> Word32 -> Value
   witnessIndex kind ix = Aeson.object ["kind" .= kind, "value" .= ix]
@@ -179,11 +183,17 @@ renderMissingRedeemers ::
   ) =>
   NonEmpty (PlutusPurpose AsItem era, ScriptHash) ->
   Value
+-- Keep singleton values compatible with existing logs. Several purposes may
+-- share one script hash, so preserve each purpose in source order in an array.
 renderMissingRedeemers scripts =
-  Aeson.object $ NonEmpty.toList $ NonEmpty.map renderTuple scripts
+  Aeson.object $ map renderTuple $ Map.toList $ foldr addPurpose Map.empty scripts
  where
-  renderTuple (scriptPurpose, sHash) =
-    Aeson.fromText (renderScriptHash sHash) .= renderScriptPurpose scriptPurpose
+  addPurpose (scriptPurpose, sHash) =
+    Map.insertWith (++) (renderScriptHash sHash) [renderScriptPurpose scriptPurpose]
+  renderTuple (sHash, purposes) =
+    Aeson.fromText sHash .= case purposes of
+      [purpose] -> purpose
+      _ -> toJSON purposes
 
 renderIncompleteWithdrawals ::
   Show payload =>
